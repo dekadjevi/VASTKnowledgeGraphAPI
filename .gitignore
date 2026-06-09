@@ -56,3 +56,23 @@ graph_storage/
 
 # Sample data
 sample_graph.json
+# virtualenvs
+.venv/
+venv/
+ENV/
+env/
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+# packaging
+build/
+dist/
+*.egg-info/
+# caches
+.mypy_cache/
+.pytest_cache/
+# macOS/editor
+.DS_Store
+.vscode/

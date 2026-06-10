@@ -380,6 +380,130 @@ async def health():
     )
 
 
+#  Provides on-demand subgraphs for the node-link / ego views (D10/D12):
+#  the server computes the slice with NetworkX and returns a small node-link
+#  payload, instead of shipping the whole 17k-node graph to the browser.
+# ============================================================================
+ 
+def _sg_load_graph(graph_id):
+    """Load a stored graph by id, mirroring the existing endpoints' pattern."""
+    if graph_id not in graph_registry:
+        raise HTTPException(status_code=404, detail="Graph ID not found")
+    file_path = graph_registry[graph_id]
+    with open(file_path, "r") as f:
+        data = json.load(f)
+    return nx.node_link_graph(data, edges="links" if "links" in data else "edges")
+ 
+ 
+def _sg_label(node_id, attrs):
+    """Best-effort human label; falls back to the node id."""
+    for key in ("name", "label", "title", "Name", "Label"):
+        if key in attrs:
+            return str(attrs[key])
+    return str(node_id)
+ 
+ 
+def _sg_serialize(graph, full_degree, wanted_edge_types=None):
+    """Serialize a (sub)graph to a compact node-link payload.
+ 
+    `full_degree` comes from the FULL graph so node sizing reflects true
+    importance, not degree within the slice.
+    """
+    nodes = [
+        {
+            "id": str(n),
+            "label": _sg_label(n, a),
+            "type": a.get("Node Type", "Unknown"),
+            "degree": int(full_degree.get(n, 0)),
+        }
+        for n, a in graph.nodes(data=True)
+    ]
+    links = [
+        {"source": str(u), "target": str(v), "type": a.get("Edge Type", "Unknown")}
+        for u, v, a in graph.edges(data=True)
+        if wanted_edge_types is None or a.get("Edge Type", "Unknown") in wanted_edge_types
+    ]
+    return nodes, links
+ 
+ 
+@app.get("/subgraph/{graph_id}", summary="Get a drawable subgraph (ego or type-filtered)")
+async def get_subgraph(
+    graph_id: str,
+    ego: str | None = None,
+    radius: int = 1,
+    node_types: str | None = None,
+    link_types: str | None = None,
+    limit: int = 300,
+):
+    """
+    Return a small, drawable slice of the graph as node-link JSON.
+ 
+    Two modes:
+      * ego mode     ?ego=<node_id>&radius=<r>      neighborhood around a node
+      * filter mode  ?node_types=A,B&limit=<N>      induced subgraph of those
+                      node types, capped to the top-N nodes by full-graph degree
+ 
+    Optional ?link_types=X,Y keeps only edges of those types in the result.
+    """
+    try:
+        G = _sg_load_graph(graph_id)
+        full_degree = dict(G.degree())
+        # Distinguish "param absent" (None -> no filter) from "param present but
+        # empty" (-> select nothing). An empty string must NOT mean "all".
+        wanted_edges = (
+            None if link_types is None
+            else set(t.strip() for t in link_types.split(",") if t.strip())
+        )
+        truncated = False
+ 
+        if ego is not None:
+            if ego not in G:
+                raise HTTPException(status_code=404, detail=f"Node '{ego}' not found")
+            H = nx.ego_graph(G, ego, radius=max(1, radius), undirected=True)
+            if H.number_of_nodes() > limit:
+                keep = sorted(
+                    (n for n in H.nodes if n != ego),
+                    key=lambda n: full_degree.get(n, 0),
+                    reverse=True,
+                )[: max(0, limit - 1)]
+                keep.append(ego)
+                H = G.subgraph(keep)
+                truncated = True
+            mode = "ego"
+        else:
+            wanted_nodes = (
+                None if node_types is None
+                else set(t.strip() for t in node_types.split(",") if t.strip())
+            )
+            selected = [
+                n for n, a in G.nodes(data=True)
+                if wanted_nodes is None or a.get("Node Type", "Unknown") in wanted_nodes
+            ]
+            if len(selected) > limit:
+                selected = sorted(selected, key=lambda n: full_degree.get(n, 0), reverse=True)[:limit]
+                truncated = True
+            H = G.subgraph(selected)
+            mode = "filter"
+ 
+        nodes, links = _sg_serialize(H, full_degree, wanted_edges)
+        return JSONResponse(content={
+            "graph_id": graph_id,
+            "mode": mode,
+            "directed": nx.is_directed(G),
+            "truncated": truncated,
+            "limit": limit,
+            "node_count": len(nodes),
+            "link_count": len(links),
+            "nodes": nodes,
+            "links": links,
+        })
+ 
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error building subgraph: {str(e)}")
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

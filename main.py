@@ -504,6 +504,42 @@ async def get_subgraph(
         raise HTTPException(status_code=500, detail=f"Error building subgraph: {str(e)}")
 
 
+## End point for the sankey diagramm . 
+
+@app.get("/type-flows/{graph_id}", summary="Aggregate edge counts by (source type, edge type, target type)")
+async def get_type_flows(graph_id: str, top: int = 0):
+    """
+    Return the type-level 'metagraph' for a Sankey: how many edges connect each
+    (source Node Type) -> (Edge Type) -> (target Node Type). Optional ?top=N
+    keeps only the N largest flows (recommended for readability). Always
+    computed over the FULL graph.
+    """
+    try:
+        from collections import Counter
+        G = _sg_load_graph(graph_id)
+        counter = Counter()
+        for u, v, a in G.edges(data=True):
+            st = G.nodes[u].get("Node Type", "Unknown")
+            tt = G.nodes[v].get("Node Type", "Unknown")
+            et = a.get("Edge Type", "Unknown")
+            counter[(st, et, tt)] += 1
+        flows = [
+            {"source_type": s, "edge_type": e, "target_type": t, "count": c}
+            for (s, e, t), c in counter.items()
+        ]
+        flows.sort(key=lambda f: f["count"], reverse=True)
+        if top and top > 0:
+            flows = flows[:top]
+        return JSONResponse(content={
+            "graph_id": graph_id,
+            "flow_count": len(flows),
+            "flows": flows,
+        })
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error building type flows: {str(e)}")
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

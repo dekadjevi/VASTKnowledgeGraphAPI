@@ -583,6 +583,71 @@ async def search_nodes(graph_id: str, q: str = "", limit: int = 10):
         raise HTTPException(status_code=500, detail=f"Error searching nodes: {str(e)}")
 
 
+#  This endpoint detects the source keys and copies their values into the
+#  canonical "Node Type" / "Edge Type" keys the rest of the pipeline expects,
+#  so every existing endpoint + the _sg_ helpers work unchanged for any graph.
+
+NODE_TYPE_KEYS = ["Node Type", "type", "node_type", "nodeType", "category", "kind"]
+EDGE_TYPE_KEYS = ["Edge Type", "role", "edge_type", "type", "relation", "relationship"]
+ 
+ 
+def _sg_first_present(attrs, keys):
+    for k in keys:
+        v = attrs.get(k)
+        if v not in (None, ""):
+            return v, k
+    return None, None
+ 
+ 
+@app.post("/normalize/{graph_id}", summary="Standardize node/edge type keys for any schema")
+async def normalize_graph(graph_id: str):
+    """
+    Ensure every node has a 'Node Type' and every edge an 'Edge Type', derived
+    from whatever key the source graph used. Call once right after /upload/.
+    """
+    try:
+        G = _sg_load_graph(graph_id)
+ 
+        node_src, edge_src = set(), set()
+ 
+        for _, a in G.nodes(data=True):
+            if not a.get("Node Type"):
+                val, key = _sg_first_present(a, NODE_TYPE_KEYS)
+                a["Node Type"] = val if val is not None else "Unknown"
+                if key:
+                    node_src.add(key)
+ 
+        for _, a in G.nodes(data=True):
+            # Fallback: an untyped node carrying coordinates is a place/location.
+            if a.get("Node Type") == "Unknown" and (a.get("lat") is not None or a.get("lon") is not None):
+                a["Node Type"] = "place"
+ 
+        for _u, _v, a in G.edges(data=True):
+            if not a.get("Edge Type"):
+                val, key = _sg_first_present(a, EDGE_TYPE_KEYS)
+                if val is not None:
+                    a["Edge Type"] = val
+                    if key:
+                        edge_src.add(key)
+                elif a.get("time") is not None:
+                    # Fallback: a timestamped, role-less edge is a travel leg.
+                    a["Edge Type"] = "travel"
+                else:
+                    a["Edge Type"] = "linked"
+ 
+        return JSONResponse(content={
+            "graph_id": graph_id,
+            "normalized": True,
+            "node_type_source_keys": sorted(node_src),
+            "edge_type_source_keys": sorted(edge_src),
+            "node_count": G.number_of_nodes(),
+            "edge_count": G.number_of_edges(),
+        })
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error normalizing graph: {str(e)}")
+
 
 if __name__ == "__main__":
     import uvicorn

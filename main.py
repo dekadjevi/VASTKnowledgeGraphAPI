@@ -380,10 +380,9 @@ async def health():
     )
 
 
-#  Provides on-demand subgraphs for the node-link / ego views (D10/D12):
+#  the node-link / ego views :
 #  the server computes the slice with NetworkX and returns a small node-link
 #  payload, instead of shipping the whole 17k-node graph to the browser.
-# ============================================================================
  
 def _sg_load_graph(graph_id):
     """Load a stored graph by id, mirroring the existing endpoints' pattern."""
@@ -458,7 +457,11 @@ async def get_subgraph(
  
         if ego is not None:
             if ego not in G:
-                raise HTTPException(status_code=404, detail=f"Node '{ego}' not found")
+                # node ids may be ints while the query param arrives as a string
+                match = next((n for n in G.nodes if str(n) == ego), None)
+                if match is None:
+                    raise HTTPException(status_code=404, detail=f"Node '{ego}' not found")
+                ego = match
             H = nx.ego_graph(G, ego, radius=max(1, radius), undirected=True)
             if H.number_of_nodes() > limit:
                 keep = sorted(
@@ -539,6 +542,47 @@ async def get_type_flows(graph_id: str, top: int = 0):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error building type flows: {str(e)}")
+
+
+
+@app.get("/search/{graph_id}", summary="Find nodes whose label/id matches a query")
+async def search_nodes(graph_id: str, q: str = "", limit: int = 10):
+    """
+    Case-insensitive substring search over node labels (and ids) for the
+    autocomplete. Returns up to `limit` matches as {id, label, type}, which the
+    search box shows and whose `id` is passed to /subgraph?ego=<id> for the
+    Ego card.
+    """
+    try:
+        query = q.strip().lower()
+        if not query:
+            return JSONResponse(content={"graph_id": graph_id, "query": q, "matches": []})
+ 
+        G = _sg_load_graph(graph_id)
+        matches = []
+        for n, a in G.nodes(data=True):
+            label = _sg_label(n, a)
+            if query in label.lower() or query in str(n).lower():
+                matches.append({
+                    "id": str(n),
+                    "label": label,
+                    "type": a.get("Node Type", "Unknown"),
+                })
+                if len(matches) >= max(1, limit):
+                    break
+ 
+        return JSONResponse(content={
+            "graph_id": graph_id,
+            "query": q,
+            "match_count": len(matches),
+            "matches": matches,
+        })
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error searching nodes: {str(e)}")
+
+
 
 if __name__ == "__main__":
     import uvicorn

@@ -425,6 +425,90 @@ def _sg_serialize(graph, full_degree, wanted_edge_types=None):
     return nodes, links
  
  
+import re as _re
+ 
+ 
+def _sg_parse_time(value):
+    """(year, month, day) ints from a heterogeneous time value, or None."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    if s.isdigit() and len(s) <= 4:
+        return (int(s), None, None)
+    head = s.replace("T", " ").split(" ", 1)[0]
+    parts = head.split("-")
+    try:
+        if len(parts) >= 3 and all(p.isdigit() for p in parts[:3]):
+            return (int(parts[0]), int(parts[1]), int(parts[2]))
+        if len(parts) >= 2 and all(p.isdigit() for p in parts[:2]):
+            return (int(parts[0]), int(parts[1]), None)
+        if parts and parts[0].isdigit():
+            return (int(parts[0]), None, None)
+    except ValueError:
+        pass
+    m = _re.search(r"\d{4}", s)
+    return (int(m.group()), None, None) if m else None
+ 
+ 
+def _sg_time_int(parsed, upper=False):
+    """Sortable int y*10^4 + m*10^2 + d. Missing parts pad low (lower bound)
+    or high (upper bound) so coarse bounds make inclusive windows."""
+    if parsed is None:
+        return None
+    y, m, d = parsed
+    m = m if m is not None else (12 if upper else 1)
+    d = d if d is not None else (31 if upper else 1)
+    return y * 10000 + m * 100 + d
+ 
+ 
+def _sg_detect_time_field(G):
+    """Return ('node'|'edge', field_name) for whichever carries more timestamps."""
+    NODE_KEYS = ["release_date", "written_date", "date", "notoriety_date", "year", "timestamp", "time"]
+    EDGE_KEYS = ["time", "timestamp", "date", "datetime"]
+    nf, ef, nv, ev = None, None, 0, 0
+    for k in NODE_KEYS:
+        c = sum(1 for _, a in G.nodes(data=True) if a.get(k) not in (None, ""))
+        if c > nv:
+            nv, nf = c, k
+    for k in EDGE_KEYS:
+        c = sum(1 for _, _, a in G.edges(data=True) if a.get(k) not in (None, ""))
+        if c > ev:
+            ev, ef = c, k
+    return ("edge", ef) if ev > nv else ("node", nf)
+ 
+ 
+def _sg_apply_time_window(G, time_from, time_to):
+    """Return a subgraph restricted to a time window, keeping the network
+    meaningful (see header). If no field/bounds apply, returns G unchanged."""
+    if time_from is None and time_to is None:
+        return G
+    source, field = _sg_detect_time_field(G)
+    if not field:
+        return G
+    lo = _sg_time_int(_sg_parse_time(time_from), upper=False) if time_from else None
+    hi = _sg_time_int(_sg_parse_time(time_to), upper=True) if time_to else None
+ 
+    def in_range(v):
+        t = _sg_time_int(_sg_parse_time(v))
+        return t is not None and (lo is None or t >= lo) and (hi is None or t <= hi)
+ 
+    if source == "edge":
+        keep_nodes = set()
+        for u, v, a in G.edges(data=True):
+            if in_range(a.get(field)):
+                keep_nodes.add(u)
+                keep_nodes.add(v)
+        return G.subgraph(keep_nodes)
+    # node-time: in-window nodes plus their neighbours, so people/labels remain
+    hits = {n for n, a in G.nodes(data=True) if in_range(a.get(field))}
+    keep = set(hits)
+    for n in hits:
+        keep.update(G.neighbors(n))
+    return G.subgraph(keep)
+ 
+ 
 @app.get("/subgraph/{graph_id}", summary="Get a drawable subgraph (ego or type-filtered)")
 async def get_subgraph(
     graph_id: str,
@@ -433,22 +517,22 @@ async def get_subgraph(
     node_types: str | None = None,
     link_types: str | None = None,
     limit: int = 300,
+    time_from: str | None = None,
+    time_to: str | None = None,
 ):
-    """
-    Return a small, drawable slice of the graph as node-link JSON.
+    """Return a small, drawable slice of the graph as node-link JSON.
  
-    Two modes:
-      * ego mode     ?ego=<node_id>&radius=<r>      neighborhood around a node
-      * filter mode  ?node_types=A,B&limit=<N>      induced subgraph of those
-                      node types, capped to the top-N nodes by full-graph degree
- 
-    Optional ?link_types=X,Y keeps only edges of those types in the result.
+    Modes:
+      * ego     ?ego=<id>&radius=<r>
+      * filter  ?node_types=A,B&limit=<N>
+    Optional ?link_types=X,Y keeps only those edge types.
+    Optional ?time_from=&time_to= restricts to a time window first.
     """
     try:
         G = _sg_load_graph(graph_id)
+        # Apply the global time window first, then ego/filter selection on top.
+        G = _sg_apply_time_window(G, time_from, time_to)
         full_degree = dict(G.degree())
-        # Distinguish "param absent" (None -> no filter) from "param present but
-        # empty" (-> select nothing). An empty string must NOT mean "all".
         wanted_edges = (
             None if link_types is None
             else set(t.strip() for t in link_types.split(",") if t.strip())
@@ -457,7 +541,6 @@ async def get_subgraph(
  
         if ego is not None:
             if ego not in G:
-                # node ids may be ints while the query param arrives as a string
                 match = next((n for n in G.nodes if str(n) == ego), None)
                 if match is None:
                     raise HTTPException(status_code=404, detail=f"Node '{ego}' not found")
@@ -500,14 +583,14 @@ async def get_subgraph(
             "nodes": nodes,
             "links": links,
         })
- 
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error building subgraph: {str(e)}")
+ 
 
 
-## End point for the sankey diagramm . 
+## End point for the sankey diagramm  .
 
 @app.get("/type-flows/{graph_id}", summary="Aggregate edge counts by (source type, edge type, target type)")
 async def get_type_flows(graph_id: str, top: int = 0):
@@ -661,7 +744,187 @@ async def normalize_graph(graph_id: str):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error normalizing graph: {str(e)}")
+
+
+
+##    timeline endpoint  
+##  Adaptive temporal aggregation, with optional category breakdown.  
+    
+
+NODE_TIME_KEYS = ["release_date", "written_date", "date", "notoriety_date", "year", "timestamp", "time"]
+EDGE_TIME_KEYS = ["time", "timestamp", "date", "datetime"]
+_TL_TOP_GROUPS = 6  # max distinct categories before the rest become "Other"
  
+ 
+def _tl_parse(value):
+    """Parse a heterogeneous time value into (year, month, day) ints.
+ 
+    Handles year-only strings ('2017'), ISO-ish datetimes ('0040-04-24 21:00:00')
+    and zero-padded fictional years. month/day are None when only a year is
+    present. Returns None if nothing date-like is found.
+    """
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    if s.isdigit() and len(s) <= 4:                 # year-only, e.g. "2017"
+        return (int(s), None, None)
+    head = s.replace("T", " ").split(" ", 1)[0]      # date part before any time
+    parts = head.split("-")
+    try:
+        if len(parts) >= 3 and all(p.isdigit() for p in parts[:3]):
+            return (int(parts[0]), int(parts[1]), int(parts[2]))
+        if len(parts) >= 2 and all(p.isdigit() for p in parts[:2]):
+            return (int(parts[0]), int(parts[1]), None)
+        if parts and parts[0].isdigit():
+            return (int(parts[0]), None, None)
+    except ValueError:
+        pass
+    import re                                        # last resort: any 4-digit year
+    m = re.search(r"\d{4}", s)
+    return (int(m.group()), None, None) if m else None
+ 
+ 
+def _tl_choose_granularity(parsed):
+    """Pick 'year' | 'month' | 'day' by readability.
+ 
+    Two guards make it robust:
+      1. If the data is essentially year-only (the common case for release years),
+         use 'year' even if a few stray records carry a full date. This stops a
+         handful of dated rows from shattering a yearly dataset into noisy months.
+      2. Otherwise choose the FINEST resolution whose distinct-bucket count stays
+         within a readable cap. This is driven by bucket *count*, not raw span, so
+         outlier dates or multi-era data can't over-coarsen the axis.
+    """
+    years, months, days = set(), set(), set()
+    md = 0
+    for y, m, d in parsed:
+        years.add(y)
+        if m is not None:
+            md += 1
+            months.add((y, m))
+            days.add((y, m, d or 1))
+    # Guard 1: mostly year-only -> year.
+    if md < 0.6 * len(parsed):
+        return "year"
+    # Guard 2: finest readable resolution.
+    MAX = 48
+    for gran, cnt in (("day", len(days)), ("month", len(months)), ("year", len(years))):
+        if 1 <= cnt <= MAX:
+            return gran
+    return "year"
+ 
+ 
+def _tl_key(p, gran):
+    """Format a bucket key for a parsed value at the chosen granularity."""
+    y, m, d = p[0], p[1], p[2]
+    if gran == "year" or m is None:
+        return f"{y:04d}"
+    if gran == "month":
+        return f"{y:04d}-{m:02d}"
+    return f"{y:04d}-{m:02d}-{(d or 1):02d}"
+ 
+ 
+@app.get("/timeline/{graph_id}", summary="Adaptive activity-over-time (optionally grouped)")
+async def get_timeline(
+    graph_id: str,
+    ego: str | None = None,
+    radius: int = 1,
+    bucket: str = "auto",
+    group_by: str | None = None,
+):
+    try:
+        from collections import Counter, defaultdict
+        G = _sg_load_graph(graph_id)
+ 
+        # Optionally scope to one entity's neighbourhood (same id-resolution as /subgraph).
+        scope = "all"
+        if ego is not None:
+            if ego not in G:
+                match = next((n for n in G.nodes if str(n) == ego), None)
+                if match is None:
+                    raise HTTPException(status_code=404, detail=f"Node '{ego}' not found")
+                ego = match
+            G = nx.ego_graph(G, ego, radius=max(1, radius), undirected=True)
+            scope = "ego"
+ 
+        # Decide whether time lives on nodes or edges: whichever has more
+        # timestamped records. This is what makes the view schema-agnostic.
+        node_field, edge_field, node_vals, edge_vals = None, None, [], []
+        for k in NODE_TIME_KEYS:
+            vals = [a[k] for _, a in G.nodes(data=True) if a.get(k) not in (None, "")]
+            if len(vals) > len(node_vals):
+                node_vals, node_field = vals, k
+        for k in EDGE_TIME_KEYS:
+            vals = [a[k] for _, _, a in G.edges(data=True) if a.get(k) not in (None, "")]
+            if len(vals) > len(edge_vals):
+                edge_vals, edge_field = vals, k
+        source, field = ("edge", edge_field) if len(edge_vals) > len(node_vals) else ("node", node_field)
+ 
+        # Collect (time_value, group_value) pairs from the chosen dimension.
+        records = []
+        if source == "edge":
+            for _u, _v, a in G.edges(data=True):
+                tv = a.get(field)
+                if tv in (None, ""):
+                    continue
+                records.append((tv, a.get(group_by) if group_by else None))
+        else:
+            for _n, a in G.nodes(data=True):
+                tv = a.get(field)
+                if tv in (None, ""):
+                    continue
+                records.append((tv, a.get(group_by) if group_by else None))
+ 
+        parsed = [(p, gv) for tv, gv in records if (p := _tl_parse(tv)) is not None]
+        if not parsed:
+            return JSONResponse(content={
+                "graph_id": graph_id, "scope": scope, "source": source,
+                "time_field": field, "granularity": None, "group_by": group_by,
+                "groups": [], "total_timestamped": 0, "buckets": [],
+            })
+ 
+        gran = bucket if bucket in ("year", "month", "day") else _tl_choose_granularity([p for p, _ in parsed])
+ 
+        # --- ungrouped: simple {key, count} buckets -------------------------
+        if not group_by:
+            counter = Counter(_tl_key(p, gran) for p, _ in parsed)
+            buckets = [{"key": k, "count": c} for k, c in sorted(counter.items())]
+            return JSONResponse(content={
+                "graph_id": graph_id, "scope": scope, "source": source,
+                "time_field": field, "granularity": gran, "group_by": None,
+                "groups": [], "total_timestamped": len(parsed), "buckets": buckets,
+            })
+ 
+        # --- grouped: keep the top categories, fold the rest into "Other" ---
+        group_totals = Counter(str(gv) if gv not in (None, "") else "Unknown" for _, gv in parsed)
+        top = [g for g, _ in group_totals.most_common(_TL_TOP_GROUPS)]
+        top_set = set(top)
+        has_other = any(g not in top_set for g in group_totals)
+        groups = top + (["Other"] if has_other else [])
+ 
+        per_bucket = defaultdict(lambda: defaultdict(int))
+        for p, gv in parsed:
+            g = str(gv) if gv not in (None, "") else "Unknown"
+            g = g if g in top_set else "Other"
+            per_bucket[_tl_key(p, gran)][g] += 1
+ 
+        buckets = []
+        for k in sorted(per_bucket):
+            by = per_bucket[k]
+            buckets.append({"key": k, "count": sum(by.values()), "by": {g: by.get(g, 0) for g in groups}})
+ 
+        return JSONResponse(content={
+            "graph_id": graph_id, "scope": scope, "source": source,
+            "time_field": field, "granularity": gran, "group_by": group_by,
+            "groups": groups, "total_timestamped": len(parsed), "buckets": buckets,
+        })
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error building timeline: {str(e)}")
+
 
 
 if __name__ == "__main__":

@@ -603,50 +603,65 @@ def _sg_first_present(attrs, keys):
 async def normalize_graph(graph_id: str):
     """
     Ensure every node has a 'Node Type' and every edge an 'Edge Type', derived
-    from whatever key the source graph used. Call once right after /upload/.
+    from whatever key the source graph used, then PERSIST the result to the
+    graph's file so every other endpoint reads the standardized keys.
+    Idempotent: re-running is harmless. Non-destructive: already-typed records
+    (MC1) are left untouched.
     """
+    if graph_id not in graph_registry:
+        raise HTTPException(status_code=404, detail="Graph ID not found")
+ 
     try:
-        G = _sg_load_graph(graph_id)
+        file_path = graph_registry[graph_id]
+        with open(file_path, "r") as f:
+            data = json.load(f)
  
         node_src, edge_src = set(), set()
  
-        for _, a in G.nodes(data=True):
-            if not a.get("Node Type"):
-                val, key = _sg_first_present(a, NODE_TYPE_KEYS)
-                a["Node Type"] = val if val is not None else "Unknown"
-                if key:
-                    node_src.add(key)
- 
-        for _, a in G.nodes(data=True):
-            # Fallback: an untyped node carrying coordinates is a place/location.
-            if a.get("Node Type") == "Unknown" and (a.get("lat") is not None or a.get("lon") is not None):
-                a["Node Type"] = "place"
- 
-        for _u, _v, a in G.edges(data=True):
-            if not a.get("Edge Type"):
-                val, key = _sg_first_present(a, EDGE_TYPE_KEYS)
+        # --- nodes: work directly on the raw JSON dict (the source of truth) --
+        for n in data.get("nodes", []):
+            if not n.get("Node Type"):
+                val, key = _sg_first_present(n, NODE_TYPE_KEYS)
                 if val is not None:
-                    a["Edge Type"] = val
+                    n["Node Type"] = val
+                    if key:
+                        node_src.add(key)
+                elif n.get("lat") is not None or n.get("lon") is not None:
+                    n["Node Type"] = "place"  # fallback: geo node
+                else:
+                    n["Node Type"] = "Unknown"
+ 
+        # --- edges: the edge list key is "links" or "edges" depending on file -
+        edge_key = "links" if "links" in data else "edges"
+        for e in data.get(edge_key, []):
+            if not e.get("Edge Type"):
+                val, key = _sg_first_present(e, EDGE_TYPE_KEYS)
+                if val is not None:
+                    e["Edge Type"] = val
                     if key:
                         edge_src.add(key)
-                elif a.get("time") is not None:
-                    # Fallback: a timestamped, role-less edge is a travel leg.
-                    a["Edge Type"] = "travel"
+                elif e.get("time") is not None:
+                    e["Edge Type"] = "travel"  # fallback: timestamped travel leg
                 else:
-                    a["Edge Type"] = "linked"
+                    e["Edge Type"] = "linked"
+ 
+        # --- persist back so all later reads see the standardized keys --------
+        with open(file_path, "w") as f:
+            json.dump(data, f)
  
         return JSONResponse(content={
             "graph_id": graph_id,
             "normalized": True,
             "node_type_source_keys": sorted(node_src),
             "edge_type_source_keys": sorted(edge_src),
-            "node_count": G.number_of_nodes(),
-            "edge_count": G.number_of_edges(),
+            "node_count": len(data.get("nodes", [])),
+            "edge_count": len(data.get(edge_key, [])),
         })
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error normalizing graph: {str(e)}")
+ 
 
 
 if __name__ == "__main__":

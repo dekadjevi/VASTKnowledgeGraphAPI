@@ -354,10 +354,23 @@ async def get_edge_type_counts(graph_id: str):
             else:
                 edge_type_counts['Unknown'] = edge_type_counts.get('Unknown', 0) + 1
 
+        # Capability: does this graph distinguish inferred vs observed edges?
+        # (MC3 carries an is_inferred flag; MC1/MC2 do not.) The frontend uses
+        # has_inferred to decide whether to show the evidence-type control.
+        inferred_count = sum(
+            1 for _, _, a in graph.edges(data=True) if 'is_inferred' in a
+        )
+        n_inferred = sum(
+            1 for _, _, a in graph.edges(data=True) if bool(a.get('is_inferred', False))
+        )
+
         return JSONResponse(content={
             "graph_id": graph_id,
             "edge_type_counts": edge_type_counts,
-            "total_edges": graph.number_of_edges()
+            "total_edges": graph.number_of_edges(),
+            "has_inferred": inferred_count > 0,
+            "inferred_edges": n_inferred,
+            "observed_edges": graph.number_of_edges() - n_inferred,
         })
 
     except Exception as e:
@@ -402,11 +415,17 @@ def _sg_label(node_id, attrs):
     return str(node_id)
  
  
-def _sg_serialize(graph, full_degree, wanted_edge_types=None):
+def _sg_serialize(graph, full_degree, wanted_edge_types=None, inferred=None):
     """Serialize a (sub)graph to a compact node-link payload.
- 
+
     `full_degree` comes from the FULL graph so node sizing reflects true
     importance, not degree within the slice.
+
+    `inferred` optionally filters edges by their `is_inferred` flag (used by
+    MC3's evidence-vs-inference question): None = keep all, True = only
+    inferred edges, False = only observed edges. Edges without the field are
+    treated as observed (is_inferred=False), so datasets that lack it (MC1/MC2)
+    are unaffected.
     """
     nodes = [
         {
@@ -417,10 +436,23 @@ def _sg_serialize(graph, full_degree, wanted_edge_types=None):
         }
         for n, a in graph.nodes(data=True)
     ]
+
+    def edge_ok(a):
+        if wanted_edge_types is not None and a.get("Edge Type", "Unknown") not in wanted_edge_types:
+            return False
+        if inferred is not None and bool(a.get("is_inferred", False)) != inferred:
+            return False
+        return True
+
     links = [
-        {"source": str(u), "target": str(v), "type": a.get("Edge Type", "Unknown")}
+        {
+            "source": str(u),
+            "target": str(v),
+            "type": a.get("Edge Type", "Unknown"),
+            "is_inferred": bool(a.get("is_inferred", False)),
+        }
         for u, v, a in graph.edges(data=True)
-        if wanted_edge_types is None or a.get("Edge Type", "Unknown") in wanted_edge_types
+        if edge_ok(a)
     ]
     return nodes, links
  
@@ -519,6 +551,7 @@ async def get_subgraph(
     limit: int = 300,
     time_from: str | None = None,
     time_to: str | None = None,
+    inferred: str | None = None,
 ):
     """Return a small, drawable slice of the graph as node-link JSON.
  
@@ -529,6 +562,14 @@ async def get_subgraph(
     Optional ?time_from=&time_to= restricts to a time window first.
     """
     try:
+        # Normalise the inferred flag: "true"/"false" -> bool, anything else -> None.
+        inf = None
+        if inferred is not None:
+            iv = str(inferred).strip().lower()
+            if iv in ("true", "1", "yes"):
+                inf = True
+            elif iv in ("false", "0", "no"):
+                inf = False
         G = _sg_load_graph(graph_id)
         # Apply the global time window first, then ego/filter selection on top.
         G = _sg_apply_time_window(G, time_from, time_to)
@@ -571,7 +612,7 @@ async def get_subgraph(
             H = G.subgraph(selected)
             mode = "filter"
  
-        nodes, links = _sg_serialize(H, full_degree, wanted_edges)
+        nodes, links = _sg_serialize(H, full_degree, wanted_edges, inferred=inf)
         return JSONResponse(content={
             "graph_id": graph_id,
             "mode": mode,
@@ -746,6 +787,91 @@ async def normalize_graph(graph_id: str):
         raise HTTPException(status_code=500, detail=f"Error normalizing graph: {str(e)}")
 
 
+## Geo Endpoint 
+
+ 
+GEO_LAT_KEYS = ["lat", "latitude", "Lat", "Latitude", "y"]
+GEO_LON_KEYS = ["lon", "lng", "long", "longitude", "Lon", "Longitude", "x"]
+ 
+ 
+def _geo_first(attrs, keys):
+    for k in keys:
+        v = attrs.get(k)
+        if isinstance(v, (int, float)):
+            return float(v)
+        if isinstance(v, str):
+            try:
+                return float(v)
+            except ValueError:
+                pass
+    return None
+ 
+ 
+@app.get("/geo/{graph_id}", summary="Coordinate-bearing nodes for the spatial map")
+async def get_geo(graph_id: str):
+    """Return points (and place-to-place links) for any graph that carries
+    coordinates. x = longitude-axis, y = latitude-axis (auto-detected)."""
+    try:
+        G = _sg_load_graph(graph_id)
+        full_degree = dict(G.degree())
+ 
+        raw = []  # (node, a, va, vb) where va<-lat-field, vb<-lon-field
+        for n, a in G.nodes(data=True):
+            va = _geo_first(a, GEO_LAT_KEYS)
+            vb = _geo_first(a, GEO_LON_KEYS)
+            if va is not None and vb is not None:
+                raw.append((n, a, va, vb))
+ 
+        if not raw:
+            return JSONResponse(content={
+                "graph_id": graph_id, "spatial": False,
+                "point_count": 0, "points": [], "links": [],
+            })
+ 
+        # Axis detection: whichever field strays outside [-90, 90] is longitude.
+        a_vals = [va for _, _, va, _ in raw]
+        b_vals = [vb for _, _, _, vb in raw]
+        a_is_lat = all(-90 <= v <= 90 for v in a_vals)
+        b_is_lat = all(-90 <= v <= 90 for v in b_vals)
+        # Default: field A = lat, field B = lon. Flip if the evidence says so.
+        if a_is_lat and not b_is_lat:
+            lat_pick = lambda va, vb: (va, vb)   # A lat, B lon (normal)
+        elif b_is_lat and not a_is_lat:
+            lat_pick = lambda va, vb: (vb, va)   # B lat, A lon (swapped)
+        else:
+            lat_pick = lambda va, vb: (va, vb)   # ambiguous -> trust field names
+ 
+        coord_of = {}
+        points = []
+        for n, a, va, vb in raw:
+            lat, lon = lat_pick(va, vb)           # lat-axis, lon-axis values
+            coord_of[n] = True
+            points.append({
+                "id": str(n),
+                "label": _sg_label(n, a),
+                "type": a.get("Node Type", a.get("type", "Unknown")),
+                "x": lon,                          # longitude-axis  (GeoJSON[0])
+                "y": lat,                          # latitude-axis   (GeoJSON[1])
+                "zone": a.get("zone") or a.get("zone_detail") or "",
+                "degree": int(full_degree.get(n, 0)),
+            })
+ 
+        # Links whose BOTH endpoints carry coordinates (drawable as map lines).
+        links = []
+        for u, v in G.edges():
+            if u in coord_of and v in coord_of:
+                links.append({"source": str(u), "target": str(v)})
+ 
+        return JSONResponse(content={
+            "graph_id": graph_id, "spatial": True,
+            "point_count": len(points), "link_count": len(links),
+            "points": points, "links": links,
+        })
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error building geo view: {str(e)}")
+ 
 
 ##    timeline endpoint  
 ##  Adaptive temporal aggregation, with optional category breakdown.  

@@ -633,32 +633,64 @@ async def get_subgraph(
 
 ## End point for the sankey diagramm  .
 
-@app.get("/type-flows/{graph_id}", summary="Aggregate edge counts by (source type, edge type, target type)")
-async def get_type_flows(graph_id: str, top: int = 0):
+@app.get("/type-flows/{graph_id}", summary="Aggregate edge counts by (source group, edge type, target group)")
+async def get_type_flows(
+    graph_id: str,
+    top: int = 0,
+    group_by: str = "Node Type",
+    focus_source: str | None = None,
+    edges: str | None = None,
+):
     """
-    Return the type-level 'metagraph' for a Sankey: how many edges connect each
-    (source Node Type) -> (Edge Type) -> (target Node Type). Optional ?top=N
-    keeps only the N largest flows (recommended for readability). Always
-    computed over the FULL graph.
+    Type-level 'metagraph' for the Sankey: how many edges connect each
+    (source group) -> (Edge Type) -> (target group).
+
+    By default the group is the node's canonical "Node Type", which reproduces
+    the original type -> relationship -> type view exactly. Pass
+    ?group_by=<attribute> to bucket by ANY other node attribute (e.g. genre)
+    instead. This stays domain-agnostic: nothing is hardcoded -- the attribute
+    is simply whatever the data carries, discovered via /node-attributes. When
+    grouping by a non-type attribute, only edges whose BOTH endpoints carry that
+    attribute are counted, so the space stays clean (no catch-all 'Unknown').
+
+    Optional ?focus_source=<value> keeps only flows leaving that group value --
+    the drill-down (e.g. focus_source=Oceanus Folk yields Oceanus Folk's outgoing
+    influence into other genres). Optional ?edges=A,B restricts to those Edge
+    Types. ?top=N keeps the N largest flows. Always computed over the FULL graph.
     """
     try:
         from collections import Counter
         G = _sg_load_graph(graph_id)
+        by_type = (group_by == "Node Type")
+        want_edges = {s.strip() for s in edges.split(",")} if edges else None
         counter = Counter()
         for u, v, a in G.edges(data=True):
-            st = G.nodes[u].get("Node Type", "Unknown")
-            tt = G.nodes[v].get("Node Type", "Unknown")
             et = a.get("Edge Type", "Unknown")
-            counter[(st, et, tt)] += 1
+            if want_edges is not None and et not in want_edges:
+                continue
+            sg = G.nodes[u].get(group_by)
+            tg = G.nodes[v].get(group_by)
+            if by_type:
+                sg = sg if sg is not None else "Unknown"
+                tg = tg if tg is not None else "Unknown"
+            elif sg is None or tg is None:
+                # grouping by an arbitrary attribute: skip edges whose endpoints
+                # don't both carry it (keeps e.g. the genre space clean).
+                continue
+            counter[(sg, et, tg)] += 1
         flows = [
             {"source_type": s, "edge_type": e, "target_type": t, "count": c}
             for (s, e, t), c in counter.items()
         ]
+        if focus_source is not None:
+            flows = [f for f in flows if f["source_type"] == focus_source]
         flows.sort(key=lambda f: f["count"], reverse=True)
         if top and top > 0:
             flows = flows[:top]
         return JSONResponse(content={
             "graph_id": graph_id,
+            "group_by": group_by,
+            "focus_source": focus_source,
             "flow_count": len(flows),
             "flows": flows,
         })
@@ -667,6 +699,149 @@ async def get_type_flows(graph_id: str, top: int = 0):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error building type flows: {str(e)}")
 
+
+@app.get("/node-attributes/{graph_id}", summary="List categorical node attributes usable for grouping")
+async def get_node_attributes(graph_id: str):
+    """
+    Report which node attributes are categorical enough to group or colour by
+    (used to populate the Sankey's "group by" selector, and a natural source for
+    the future property filters). Domain-agnostic: it just inspects whatever
+    attributes the data carries, excluding identity/label and the canonical
+    "Node Type". An attribute qualifies if it appears on a meaningful share of
+    nodes and has modest cardinality (2..50 distinct values) -- so a music graph
+    surfaces `genre`, a maritime graph surfaces its own fields, with no
+    per-dataset code.
+    """
+    try:
+        from collections import defaultdict
+        G = _sg_load_graph(graph_id)
+        total = max(1, G.number_of_nodes())
+        coverage = defaultdict(int)
+        distinct = defaultdict(set)
+        SKIP = {"id", "label", "name", "Node Type"}
+        for _, a in G.nodes(data=True):
+            for k, val in a.items():
+                if k in SKIP or val is None or isinstance(val, (dict, list)):
+                    continue
+                coverage[k] += 1
+                if len(distinct[k]) <= 60:
+                    distinct[k].add(str(val))
+        groupable = []
+        for k, cov in coverage.items():
+            nd = len(distinct[k])
+            if 2 <= nd <= 50 and cov >= max(2, int(total * 0.02)):
+                groupable.append({"key": k, "coverage": cov, "distinct": nd})
+        groupable.sort(key=lambda x: -x["coverage"])
+        return JSONResponse(content={
+            "graph_id": graph_id,
+            "groupable": groupable,
+            "total_nodes": G.number_of_nodes(),
+        })
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error reading node attributes: {str(e)}")
+
+
+
+@app.get("/influence-ranking/{graph_id}", summary="Rank nodes most affected by a seed group, optionally rolled up via a relation")
+async def get_influence_ranking(
+    graph_id: str,
+    source_value: str,
+    source_attr: str = "Node Type",
+    edges: str | None = None,
+    direction: str = "incoming",
+    via: str | None = None,
+    top: int = 15,
+):
+    """
+    Generic "who is most affected by X" ranking. Domain-agnostic: nothing about
+    music is hardcoded -- the seed group, the traversed edge types, the traversal
+    direction and the roll-up relation are all parameters, so a maritime graph
+    could rank, say, vessels most implicated by an event the same way.
+
+    Steps:
+      1. Seed S = nodes whose `source_attr` == `source_value`
+         (e.g. genre == "Oceanus Folk").
+      2. Affected A = nodes linked to S by an edge whose type is in `edges`, in
+         the given `direction`. With "incoming", A holds predecessors of S
+         (nodes pointing into the seed); with "outgoing", successors. Members of
+         S are excluded -- a group is not "affected by" itself. NB MC1 influence
+         edges point derivative -> original, so "incoming" = works that derive
+         from the seed = works the seed influenced.
+      3. If `via` is given, roll each affected node up through that relation
+         (e.g. PerformerOf -> performer) and rank the roll-up nodes by the number
+         of distinct affected items they account for; otherwise rank A directly
+         by how many seed nodes each connects to.
+
+    MC1 example: source_attr=genre, source_value=Oceanus Folk,
+    edges=InStyleOf,CoverOf,InterpolatesFrom,DirectlySamples,LyricalReferenceTo,
+    direction=incoming, via=PerformerOf -> the artists whose songs most derive
+    from Oceanus Folk.
+    """
+    try:
+        from collections import defaultdict
+        G = _sg_load_graph(graph_id)
+        directed = G.is_directed()
+        want_edges = {s.strip() for s in edges.split(",")} if edges else None
+
+        def edge_ok(a):
+            return want_edges is None or a.get("Edge Type", "Unknown") in want_edges
+
+        seed = {n for n, a in G.nodes(data=True) if a.get(source_attr) == source_value}
+
+        affected = defaultdict(set)  # affected node -> set of seed nodes it links to
+        for u, v, a in G.edges(data=True):
+            if not edge_ok(a):
+                continue
+            if v in seed and u not in seed and (not directed or direction == "incoming"):
+                affected[u].add(v)
+            if u in seed and v not in seed and (not directed or direction == "outgoing"):
+                affected[v].add(u)
+
+        A = set(affected.keys())
+
+        def lbl(n):
+            a = G.nodes[n]
+            return a.get("name") or a.get("label") or str(n)
+
+        def typ(n):
+            return G.nodes[n].get("Node Type", "Unknown")
+
+        if via:
+            roll = defaultdict(set)  # roll-up node -> set of affected nodes
+            for u, v, a in G.edges(data=True):
+                if a.get("Edge Type") != via:
+                    continue
+                if v in A:
+                    roll[u].add(v)
+                if u in A:
+                    roll[v].add(u)
+            ranked = sorted(
+                ((n, items) for n, items in roll.items() if n not in A and n not in seed),
+                key=lambda kv: len(kv[1]), reverse=True,
+            )
+            ranking = [{"id": str(n), "label": lbl(n), "type": typ(n), "count": len(items)}
+                       for n, items in ranked[:top]]
+        else:
+            ranked = sorted(affected.items(), key=lambda kv: len(kv[1]), reverse=True)
+            ranking = [{"id": str(n), "label": lbl(n), "type": typ(n), "count": len(s)}
+                       for n, s in ranked[:top]]
+
+        return JSONResponse(content={
+            "graph_id": graph_id,
+            "source_attr": source_attr,
+            "source_value": source_value,
+            "direction": direction,
+            "via": via,
+            "seed_count": len(seed),
+            "affected_count": len(A),
+            "ranking": ranking,
+        })
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error building influence ranking: {str(e)}")
 
 
 @app.get("/search/{graph_id}", summary="Find nodes whose label/id matches a query")

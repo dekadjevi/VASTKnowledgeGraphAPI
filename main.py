@@ -607,7 +607,37 @@ async def get_subgraph(
                 if wanted_nodes is None or a.get("Node Type", "Unknown") in wanted_nodes
             ]
             if len(selected) > limit:
-                selected = sorted(selected, key=lambda n: full_degree.get(n, 0), reverse=True)[:limit]
+                # Connected sample (not top-N-by-degree): grow outward from the
+                # busiest hubs via BFS so every node drawn keeps a visible edge to
+                # its parent. Crucially the traversal graph is built from ONLY the
+                # edges that will actually be drawn (the active link types) -- so a
+                # node can't enter the sample on the strength of a hidden edge type
+                # and then appear stranded once that type is filtered out.
+                from collections import deque
+                sel_set = set(selected)
+                Gf = nx.Graph()
+                Gf.add_nodes_from(selected)
+                for u, v, a in G.edges(data=True):
+                    if u in sel_set and v in sel_set and (
+                        wanted_edges is None or a.get("Edge Type", "Unknown") in wanted_edges
+                    ):
+                        Gf.add_edge(u, v)
+                deg_in_sample = dict(Gf.degree())
+                # seed order: nodes with the most *drawable* neighbours first, so a
+                # seed always brings visible connections along.
+                seeds = sorted(Gf.nodes, key=lambda n: deg_in_sample.get(n, 0), reverse=True)
+                visited, order, si = set(), [], 0
+                while len(order) < limit and si < len(seeds):
+                    s = seeds[si]; si += 1
+                    if s in visited:
+                        continue
+                    dq = deque([s]); visited.add(s)
+                    while dq and len(order) < limit:
+                        u = dq.popleft(); order.append(u)
+                        for v in sorted(Gf.neighbors(u), key=lambda n: deg_in_sample.get(n, 0), reverse=True):
+                            if v not in visited:
+                                visited.add(v); dq.append(v)
+                selected = order[:limit]
                 truncated = True
             H = G.subgraph(selected)
             mode = "filter"
@@ -721,7 +751,12 @@ async def get_node_attributes(graph_id: str):
         SKIP = {"id", "label", "name", "Node Type"}
         for _, a in G.nodes(data=True):
             for k, val in a.items():
-                if k in SKIP or val is None or isinstance(val, (dict, list)):
+                # Skip identity/label, missing values, containers, and boolean
+                # flags: grouping a Sankey by a yes/no attribute (e.g. notable,
+                # single) is not meaningful, so those are not offered as
+                # grouping dimensions. This stays domain-agnostic -- it filters
+                # by value type, not by attribute name.
+                if k in SKIP or val is None or isinstance(val, bool) or isinstance(val, (dict, list)):
                     continue
                 coverage[k] += 1
                 if len(distinct[k]) <= 60:

@@ -46,6 +46,28 @@ graph_registry: Dict[str, str] = {}
 default_graph_id = "default"
 
 
+
+# ============================================================================
+#  main.py — VAST KG backend.  Sections below follow the data's journey.
+#  TABLE OF CONTENTS (in file order):
+#    1  · Setup & registry .............. imports, app, CORS, graph_registry, key-lists (above)
+#    2  · Distribution helper ........... degree-centrality helper used by /summary
+#    3  · Loading & lifecycle ........... /upload, /set-default
+#    4  · Sidebar & header metadata ..... /summary, /node-types, /edge-types
+#    5  · Health ........................ /health
+#    6  · Shared subgraph helpers ....... load graph, labels, serialize, time window
+#    7  · NODE-LINK DIAGRAM ............. /subgraph  (the drawable connected sample)
+#    8  · Sankey & analysis ............. /type-flows, /node-attributes, /influence-ranking
+#    9  · Search ........................ /search
+#    10 · Schema normalization .......... /normalize
+#    11 · Spatial / geographic .......... /geo
+#    12 · Temporal / timeline ........... /timeline
+# ============================================================================
+
+# ==========================================================================
+# 2 · DISTRIBUTION HELPER
+#    degree-centrality helper (used by /summary)
+# ==========================================================================
 def create_degree_centrality_distribution(graph):
     """
     Create a distribution of degree centrality values instead of per-node values.
@@ -102,6 +124,11 @@ def create_degree_centrality_distribution(graph):
     return distribution
 
 
+
+# ==========================================================================
+# 3 · LOADING & LIFECYCLE
+#    bring a dataset into memory and register it
+# ==========================================================================
 @app.post("/upload/", summary="Upload a NetworkX graph JSON file")
 async def upload_graph(file: UploadFile = File(...)):
     """
@@ -199,6 +226,11 @@ async def set_default_graph(graph_id: str):
     )
 
 
+
+# ==========================================================================
+# 4 · SIDEBAR & HEADER METADATA
+#    counts that populate the sidebar and the header
+# ==========================================================================
 @app.get("/summary/{graph_id}", summary="Get graph summary by ID")
 async def get_graph_summary(graph_id: str):
     """
@@ -377,6 +409,11 @@ async def get_edge_type_counts(graph_id: str):
         raise HTTPException(status_code=500, detail=f"Error processing graph: {str(e)}")
 
 
+
+# ==========================================================================
+# 5 · HEALTH
+#    liveness check
+# ==========================================================================
 @app.get('/health/', summary='Health check endpoint to verify the API is running.')
 async def health():
     """
@@ -397,6 +434,11 @@ async def health():
 #  the server computes the slice with NetworkX and returns a small node-link
 #  payload, instead of shipping the whole 17k-node graph to the browser.
  
+
+# ==========================================================================
+# 6 · SHARED SUBGRAPH HELPERS
+#    load graph by id, build labels, serialize nodes/links, apply the time window
+# ==========================================================================
 def _sg_load_graph(graph_id):
     """Load a stored graph by id, mirroring the existing endpoints' pattern."""
     if graph_id not in graph_registry:
@@ -541,11 +583,17 @@ def _sg_apply_time_window(G, time_from, time_to):
     return G.subgraph(keep)
  
  
+
+# ==========================================================================
+# 7 · NODE-LINK DIAGRAM
+#    builds the drawable connected sample (ego OR type/link-filtered BFS)
+# ==========================================================================
 @app.get("/subgraph/{graph_id}", summary="Get a drawable subgraph (ego or type-filtered)")
 async def get_subgraph(
     graph_id: str,
     ego: str | None = None,
     radius: int = 1,
+    nodes: str | None = None,
     node_types: str | None = None,
     link_types: str | None = None,
     limit: int = 300,
@@ -580,22 +628,47 @@ async def get_subgraph(
         )
         truncated = False
  
-        if ego is not None:
+        if nodes is not None:
+            # Draw an explicit set of node ids (e.g. a component clicked in the
+            # Connected components card). Induces the subgraph on those nodes;
+            # link-type filtering still applies at serialization.
+            want = {s.strip() for s in nodes.split(",") if s.strip()}
+            idset = [n for n in G.nodes if str(n) in want]
+            H = G.subgraph(idset)
+            if H.number_of_nodes() > limit:
+                keep = sorted(idset, key=lambda n: full_degree.get(n, 0), reverse=True)[:limit]
+                H = G.subgraph(keep)
+                truncated = True
+            mode = "nodes"
+        elif ego is not None:
             if ego not in G:
                 match = next((n for n in G.nodes if str(n) == ego), None)
                 if match is None:
                     raise HTTPException(status_code=404, detail=f"Node '{ego}' not found")
                 ego = match
-            H = nx.ego_graph(G, ego, radius=max(1, radius), undirected=True)
-            if H.number_of_nodes() > limit:
-                keep = sorted(
-                    (n for n in H.nodes if n != ego),
-                    key=lambda n: full_degree.get(n, 0),
-                    reverse=True,
-                )[: max(0, limit - 1)]
-                keep.append(ego)
-                H = G.subgraph(keep)
+            ball = nx.ego_graph(G, ego, radius=max(1, radius), undirected=True)
+            if ball.number_of_nodes() > limit:
+                # Connected truncation: BFS outward from the centre so every kept
+                # node keeps its parent (toward the centre) in the set. An
+                # arbitrary top-N-by-degree slice would leave outer-ring nodes
+                # edge-less -- the node that connects them to the centre falls
+                # outside the sample.
+                from collections import deque
+                UG = ball.to_undirected(as_view=False)
+                seen, order, dq = {ego}, [ego], deque([ego])
+                while dq and len(order) < limit:
+                    u = dq.popleft()
+                    for v in sorted(UG.neighbors(u), key=lambda n: full_degree.get(n, 0), reverse=True):
+                        if v not in seen:
+                            seen.add(v)
+                            order.append(v)
+                            dq.append(v)
+                            if len(order) >= limit:
+                                break
+                H = G.subgraph(order[:limit])
                 truncated = True
+            else:
+                H = ball
             mode = "ego"
         else:
             wanted_nodes = (
@@ -663,6 +736,102 @@ async def get_subgraph(
 
 ## End point for the sankey diagramm  .
 
+
+# ==========================================================================
+# 7b · COMMUNITY DISCOVERY
+#    weakly connected components of the currently filtered graph
+# ==========================================================================
+@app.get("/components/{graph_id}", summary="Connected components of the filtered graph")
+async def get_components(
+    graph_id: str,
+    node_types: str | None = None,
+    link_types: str | None = None,
+    time_from: str | None = None,
+    time_to: str | None = None,
+    top: int = 12,
+    sample: int = 60,
+):
+    """
+    Split the graph into connected components (islands of mutually reachable
+    nodes) over the SAME filters the node-link uses: active node types, active
+    link types, and the time window. Purely structural and domain-agnostic --
+    no attribute names are referenced.
+
+    Returns a summary (component count, largest size, number of singletons) and
+    the largest `top` components, each with up to `sample` node ids so the front
+    end can draw a clicked component in the node-link (via /subgraph?nodes=...).
+    """
+    try:
+        G = _sg_load_graph(graph_id)
+        G = _sg_apply_time_window(G, time_from, time_to)
+        wanted_nodes = (
+            None if node_types is None
+            else set(t.strip() for t in node_types.split(",") if t.strip())
+        )
+        wanted_edges = (
+            None if link_types is None
+            else set(t.strip() for t in link_types.split(",") if t.strip())
+        )
+        selected = [
+            n for n, a in G.nodes(data=True)
+            if wanted_nodes is None or a.get("Node Type", "Unknown") in wanted_nodes
+        ]
+        sel = set(selected)
+        UG = nx.Graph()
+        UG.add_nodes_from(selected)
+        for u, v, a in G.edges(data=True):
+            if u in sel and v in sel and (
+                wanted_edges is None or a.get("Edge Type", "Unknown") in wanted_edges
+            ):
+                UG.add_edge(u, v)
+
+        comps = sorted(nx.connected_components(UG), key=len, reverse=True)
+        singletons = sum(1 for c in comps if len(c) == 1)
+        from collections import deque
+        top_list = []
+        for i, c in enumerate(comps[: max(1, top)]):
+            if len(c) <= sample:
+                ids = [str(x) for x in c]
+            else:
+                # Grow a CONNECTED slice from the component's busiest node, so the
+                # drawn subgraph actually has edges. An arbitrary slice of a big
+                # component would induce mostly isolated-looking nodes (their real
+                # neighbours fall outside the sample), which is exactly the
+                # "looks like singletons but isn't" artifact.
+                seed = max(c, key=lambda n: UG.degree(n))
+                seen, order, dq = {seed}, [seed], deque([seed])
+                while dq and len(order) < sample:
+                    u = dq.popleft()
+                    for v in UG.neighbors(u):
+                        if v not in seen:
+                            seen.add(v)
+                            order.append(v)
+                            dq.append(v)
+                            if len(order) >= sample:
+                                break
+                ids = [str(x) for x in order[:sample]]
+            top_list.append({"index": i, "size": len(c), "node_ids": ids})
+
+        return JSONResponse(content={
+            "graph_id": graph_id,
+            "summary": {
+                "count": len(comps),
+                "largest": len(comps[0]) if comps else 0,
+                "singletons": singletons,
+                "nodes_considered": len(selected),
+            },
+            "components": top_list,
+        })
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error building components: {str(e)}")
+
+
+# ==========================================================================
+# 8 · SANKEY & ANALYSIS
+#    aggregate flows, groupable attributes, influence ranking
+# ==========================================================================
 @app.get("/type-flows/{graph_id}", summary="Aggregate edge counts by (source group, edge type, target group)")
 async def get_type_flows(
     graph_id: str,
@@ -766,6 +935,25 @@ async def get_node_attributes(graph_id: str):
             nd = len(distinct[k])
             if 2 <= nd <= 50 and cov >= max(2, int(total * 0.02)):
                 groupable.append({"key": k, "coverage": cov, "distinct": nd})
+
+        # Keep only attributes that actually produce flows: there must be enough
+        # edges whose BOTH endpoints carry the attribute. Otherwise grouping by it
+        # yields an empty Sankey -- e.g. an attribute living on a leaf node type
+        # that never connects to itself (zone on places, plan_type on plans...).
+        # Structural and domain-agnostic: it inspects the graph, not names.
+        cand = {g["key"] for g in groupable}
+        if cand:
+            support = defaultdict(int)
+            for u, v in G.edges():
+                au, av = G.nodes[u], G.nodes[v]
+                for k in cand:
+                    if au.get(k) is not None and av.get(k) is not None:
+                        support[k] += 1
+            min_edges = max(3, G.number_of_edges() // 100)
+            for g in groupable:
+                g["edge_support"] = support.get(g["key"], 0)
+            groupable = [g for g in groupable if g["edge_support"] >= min_edges]
+
         groupable.sort(key=lambda x: -x["coverage"])
         return JSONResponse(content={
             "graph_id": graph_id,
@@ -879,6 +1067,11 @@ async def get_influence_ranking(
         raise HTTPException(status_code=500, detail=f"Error building influence ranking: {str(e)}")
 
 
+
+# ==========================================================================
+# 9 · SEARCH
+#    find nodes by label/id
+# ==========================================================================
 @app.get("/search/{graph_id}", summary="Find nodes whose label/id matches a query")
 async def search_nodes(graph_id: str, q: str = "", limit: int = 10):
     """
@@ -925,6 +1118,11 @@ NODE_TYPE_KEYS = ["Node Type", "type", "node_type", "nodeType", "category", "kin
 EDGE_TYPE_KEYS = ["Edge Type", "role", "edge_type", "type", "relation", "relationship"]
  
  
+
+# ==========================================================================
+# 10 · SCHEMA NORMALIZATION
+#    standardize node/edge type keys for any schema
+# ==========================================================================
 def _sg_first_present(attrs, keys):
     for k in keys:
         v = attrs.get(k)
@@ -1004,6 +1202,11 @@ GEO_LAT_KEYS = ["lat", "latitude", "Lat", "Latitude", "y"]
 GEO_LON_KEYS = ["lon", "lng", "long", "longitude", "Lon", "Longitude", "x"]
  
  
+
+# ==========================================================================
+# 11 · SPATIAL / GEOGRAPHIC
+#    coordinate-bearing nodes for the map
+# ==========================================================================
 def _geo_first(attrs, keys):
     for k in keys:
         v = attrs.get(k)
@@ -1092,6 +1295,11 @@ EDGE_TIME_KEYS = ["time", "timestamp", "date", "datetime"]
 _TL_TOP_GROUPS = 6  # max distinct categories before the rest become "Other"
  
  
+
+# ==========================================================================
+# 12 · TEMPORAL / TIMELINE
+#    adaptive activity-over-time
+# ==========================================================================
 def _tl_parse(value):
     """Parse a heterogeneous time value into (year, month, day) ints.
  

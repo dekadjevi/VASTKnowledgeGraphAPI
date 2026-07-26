@@ -646,7 +646,22 @@ async def get_subgraph(
                 if match is None:
                     raise HTTPException(status_code=404, detail=f"Node '{ego}' not found")
                 ego = match
-            ball = nx.ego_graph(G, ego, radius=max(1, radius), undirected=True)
+            # Build the ego ball over an evidence-filtered view, so under the
+            # Observed / Inferred control the neighbourhood only reaches nodes via
+            # edges that will actually be drawn (otherwise the outer ring would be
+            # sampled through edges that serialization then strips -> false
+            # singletons). The link-type filter is intentionally NOT applied here:
+            # drilling into one entity should reveal its full set of relationships.
+            if inf is None:
+                src = G
+            else:
+                src = nx.DiGraph() if G.is_directed() else nx.Graph()
+                src.add_nodes_from(G.nodes(data=True))
+                src.add_edges_from(
+                    (u, v, a) for u, v, a in G.edges(data=True)
+                    if bool(a.get("is_inferred", False)) == inf
+                )
+            ball = nx.ego_graph(src, ego, radius=max(1, radius), undirected=True)
             if ball.number_of_nodes() > limit:
                 # Connected truncation: BFS outward from the centre so every kept
                 # node keeps its parent (toward the centre) in the set. An
@@ -693,7 +708,7 @@ async def get_subgraph(
                 for u, v, a in G.edges(data=True):
                     if u in sel_set and v in sel_set and (
                         wanted_edges is None or a.get("Edge Type", "Unknown") in wanted_edges
-                    ):
+                    ) and (inf is None or bool(a.get("is_inferred", False)) == inf):
                         Gf.add_edge(u, v)
                 deg_in_sample = dict(Gf.degree())
                 # seed order: nodes with the most *drawable* neighbours first, so a
@@ -748,6 +763,7 @@ async def get_components(
     link_types: str | None = None,
     time_from: str | None = None,
     time_to: str | None = None,
+    inferred: str | None = None,
     top: int = 12,
     sample: int = 60,
 ):
@@ -772,6 +788,13 @@ async def get_components(
             None if link_types is None
             else set(t.strip() for t in link_types.split(",") if t.strip())
         )
+        inf = None
+        if inferred is not None:
+            iv = str(inferred).strip().lower()
+            if iv in ("true", "1", "yes"):
+                inf = True
+            elif iv in ("false", "0", "no"):
+                inf = False
         selected = [
             n for n, a in G.nodes(data=True)
             if wanted_nodes is None or a.get("Node Type", "Unknown") in wanted_nodes
@@ -782,7 +805,7 @@ async def get_components(
         for u, v, a in G.edges(data=True):
             if u in sel and v in sel and (
                 wanted_edges is None or a.get("Edge Type", "Unknown") in wanted_edges
-            ):
+            ) and (inf is None or bool(a.get("is_inferred", False)) == inf):
                 UG.add_edge(u, v)
 
         comps = sorted(nx.connected_components(UG), key=len, reverse=True)
